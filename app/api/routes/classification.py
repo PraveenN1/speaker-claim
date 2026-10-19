@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from app.api.dependencies import agent, dataset
+from app.core.errors import AgentErrorCode
 from app.models import AgentInput
 from app.schemas import ClassifyRequest
 from app.services.classification import AgentFailure
@@ -20,5 +21,8 @@ async def classify(request: ClassifyRequest, request_context: Request):
             request.agent_version,
         )
     except AgentFailure as error:
-        raise HTTPException(status_code=504 if str(error) == "provider_timeout" else 502,
-                            detail="provider could not produce valid output") from error
+        status_code = 504 if error.code == AgentErrorCode.PROVIDER_TIMEOUT else 502
+        raise HTTPException(status_code=status_code, detail={
+            "code": error.code.value,
+            "message": "provider request could not be completed",
+        }) from error

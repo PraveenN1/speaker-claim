@@ -5,19 +5,23 @@ import json
 from dataclasses import asdict
 from typing import Any, Protocol
 
+from app.core.errors import AgentErrorCode
 from .catalogue import Dataset
 from app.schemas import AgentInput, AgentVersion, ClassifiedAnswer
 from .validation import OutputValidationError, validate_output
 
 try:
-    from openai import APIConnectionError, InternalServerError, RateLimitError
-    TRANSIENT_ERRORS = (APIConnectionError, InternalServerError, RateLimitError, TimeoutError)
+    from openai import APIConnectionError, AuthenticationError, BadRequestError, InternalServerError, RateLimitError
+    TRANSIENT_ERRORS = (APIConnectionError, InternalServerError)
 except ImportError:  # Provider protocol remains independently testable.
-    TRANSIENT_ERRORS = (TimeoutError,)
+    TRANSIENT_ERRORS = ()
+    AuthenticationError = BadRequestError = RateLimitError = None
 
 
 class AgentFailure(RuntimeError):
-    pass
+    def __init__(self, code: AgentErrorCode) -> None:
+        self.code = code
+        super().__init__(code.value)
 
 
 class Provider(Protocol):
@@ -55,35 +59,50 @@ class ClaimAgent:
                 output = self._materialize(item, response.get("content"))
                 return validate_output(output, item.ai_answer, self.dataset)
             except OutputValidationError as error:
-                raise AgentFailure("invalid_provider_output") from error
-        raise AgentFailure("turn_limit_exhausted")
+                raise AgentFailure(AgentErrorCode.INVALID_PROVIDER_OUTPUT) from error
+        raise AgentFailure(AgentErrorCode.TURN_LIMIT_EXHAUSTED)
 
     async def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         for attempt in range(2):
             try:
                 return await asyncio.wait_for(self.provider.complete(messages, [TOOL]), timeout=self.timeout_seconds)
+            except TimeoutError as error:
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise AgentFailure(AgentErrorCode.PROVIDER_TIMEOUT) from error
+            except RateLimitError as error:
+                if "quota" in str(error).lower():
+                    raise AgentFailure(AgentErrorCode.PROVIDER_QUOTA_EXHAUSTED) from error
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise AgentFailure(AgentErrorCode.PROVIDER_RATE_LIMITED) from error
+            except AuthenticationError as error:
+                raise AgentFailure(AgentErrorCode.PROVIDER_AUTHENTICATION_FAILED) from error
+            except BadRequestError as error:
+                raise AgentFailure(AgentErrorCode.PROVIDER_REQUEST_REJECTED) from error
             except TRANSIENT_ERRORS as error:
                 if attempt == 0:
                     await asyncio.sleep(0.25)
                     continue
-                code = "provider_timeout" if isinstance(error, TimeoutError) else "transient_provider_failure"
-                raise AgentFailure(code) from error
+                raise AgentFailure(AgentErrorCode.TRANSIENT_PROVIDER_FAILURE) from error
             except Exception as error:
-                raise AgentFailure("provider_failure") from error
+                raise AgentFailure(AgentErrorCode.PROVIDER_FAILURE) from error
         raise AssertionError("unreachable")
 
     def _execute_tool(self, call: dict[str, Any]) -> dict[str, Any]:
         if call.get("function", {}).get("name") != "get_brand_facts":
-            raise AgentFailure("illegal_tool")
+            raise AgentFailure(AgentErrorCode.ILLEGAL_TOOL)
         try:
             arguments = json.loads(call["function"]["arguments"])
             if set(arguments) != {"brand_id"} or not isinstance(arguments["brand_id"], str):
                 raise ValueError("invalid tool arguments")
             facts = self.dataset.get_brand_facts(arguments["brand_id"])
         except KeyError as error:
-            raise AgentFailure("unknown_requested_brand") from error
+            raise AgentFailure(AgentErrorCode.UNKNOWN_REQUESTED_BRAND) from error
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            raise AgentFailure("invalid_tool_arguments") from error
+            raise AgentFailure(AgentErrorCode.INVALID_TOOL_ARGUMENTS) from error
         return {"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps([asdict(fact) for fact in facts], default=str)}
 
     def _materialize(self, item: AgentInput, content: Any) -> ClassifiedAnswer:
@@ -102,4 +121,4 @@ class ClaimAgent:
                                "claim_id": f"{item.answer_id}:{start}:{end}"})
             return ClassifiedAnswer(answer_id=item.answer_id, claims=claims)
         except (KeyError, TypeError, json.JSONDecodeError, ValueError) as error:
-            raise AgentFailure("malformed_provider_output") from error
+            raise AgentFailure(AgentErrorCode.MALFORMED_PROVIDER_OUTPUT) from error
